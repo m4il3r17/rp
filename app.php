@@ -252,7 +252,7 @@ function testBug($url)
     return 0;
 }
 
-$url = "65.21.202.72:5571";
+$url = "162.55.84.187";
 $extractor = new ConfigExtractor($url);
 
 // Example function to demonstrate usage:
