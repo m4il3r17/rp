@@ -9,6 +9,11 @@ function log_message($message) {
     echo date('[Y-m-d H:i:s] ') . $message . PHP_EOL;
 }
 
+// Check if pcntl extension is loaded
+if (!extension_loaded('pcntl')) {
+    die("pcntl extension is not loaded. Please enable it in your php.ini.\n");
+}
+
 // Create a TCP Stream socket
 $sock = socket_create(AF_INET, SOCK_STREAM, SOL_TCP);
 if ($sock === false) {
@@ -25,15 +30,33 @@ if (socket_listen($sock, 5) === false) {
 
 log_message("SOCKS5 server listening on $address:$port");
 
+// Handle SIGCHLD to prevent zombie processes
+pcntl_signal(SIGCHLD, function($signo) {
+    while (pcntl_waitpid(-1, $status, WNOHANG) > 0);
+});
+
 while (true) {
-    $client = socket_accept($sock);
+    $client = @socket_accept($sock);
     if ($client === false) {
-        log_message("socket_accept() failed: " . socket_strerror(socket_last_error($sock)));
+        usleep(100);
         continue;
     }
 
-    // Handle client in a separate process or thread if needed
-    handle_client($client);
+    $pid = pcntl_fork();
+    if ($pid == -1) {
+        log_message("Could not fork process");
+        socket_close($client);
+        continue;
+    } elseif ($pid === 0) {
+        // Child process
+        socket_close($sock); // Close the server socket in the child
+        handle_client($client);
+        socket_close($client);
+        exit(0);
+    } else {
+        // Parent process
+        socket_close($client); // Close the client socket in the parent
+    }
 }
 
 socket_close($sock);
@@ -45,7 +68,6 @@ function handle_client($client) {
     $data = socket_read($client, 2);
     if (!$data || strlen($data) != 2) {
         log_message("Invalid handshake from client");
-        socket_close($client);
         return;
     }
 
@@ -60,7 +82,6 @@ function handle_client($client) {
     $header = socket_read($client, 4);
     if (!$header || strlen($header) != 4) {
         log_message("Failed to read request header");
-        socket_close($client);
         return;
     }
 
@@ -72,7 +93,6 @@ function handle_client($client) {
     if ($cmd != 1) { // Only support CONNECT
         socket_write($client, "\x05\x07\x00\x01\x00\x00\x00\x00\x00\x00"); // Command not supported
         log_message("Unsupported command: $cmd");
-        socket_close($client);
         return;
     }
 
@@ -90,7 +110,6 @@ function handle_client($client) {
     } else {
         socket_write($client, "\x05\x08\x00\x01\x00\x00\x00\x00\x00\x00"); // Address type not supported
         log_message("Address type not supported: $atype");
-        socket_close($client);
         return;
     }
 
@@ -104,7 +123,6 @@ function handle_client($client) {
         if ($ip == $address) {
             log_message("DNS resolution failed for $address");
             socket_write($client, "\x05\x04\x00\x01\x00\x00\x00\x00\x00\x00"); // Host unreachable
-            socket_close($client);
             return;
         }
         $address = $ip;
@@ -114,7 +132,6 @@ function handle_client($client) {
     $remote = socket_create(AF_INET, SOCK_STREAM, SOL_TCP);
     if ($remote === false) {
         log_message("Failed to create remote socket: " . socket_strerror(socket_last_error()));
-        socket_close($client);
         return;
     }
 
@@ -122,7 +139,6 @@ function handle_client($client) {
         $err = socket_last_error($remote);
         log_message("Failed to connect to $address:$dest_port - " . socket_strerror($err));
         socket_write($client, "\x05\x05\x00\x01\x00\x00\x00\x00\x00\x00"); // Connection refused
-        socket_close($client);
         socket_close($remote);
         return;
     }
@@ -131,6 +147,9 @@ function handle_client($client) {
     log_message("Connected to $address:$dest_port");
 
     // Relay data
+    socket_set_nonblock($client);
+    socket_set_nonblock($remote);
+
     $sockets = [$client, $remote];
     while (true) {
         $read = $sockets;
@@ -138,31 +157,36 @@ function handle_client($client) {
         $except = null;
 
         if (socket_select($read, $write, $except, null) < 1) {
-            log_message("socket_select() failed: " . socket_strerror(socket_last_error()));
-            break;
+            usleep(100);
+            continue;
         }
 
         foreach ($read as $sock) {
-            $data = socket_read($sock, 8192, PHP_BINARY_READ);
+            $data = @socket_read($sock, 8192, PHP_BINARY_READ);
             if ($data === false) {
                 $err = socket_last_error($sock);
-                log_message("socket_read() failed: " . socket_strerror($err));
-                break 2;
+                if ($err != SOCKET_EWOULDBLOCK && $err != SOCKET_EAGAIN) {
+                    log_message("socket_read() failed: " . socket_strerror($err));
+                    break 2;
+                }
+                continue;
             } elseif ($data === '') {
                 log_message("Connection closed by peer");
                 break 2;
             }
 
             $other_sock = ($sock === $client) ? $remote : $client;
-            if (socket_write($other_sock, $data) === false) {
+            $write_result = @socket_write($other_sock, $data);
+            if ($write_result === false) {
                 $err = socket_last_error($other_sock);
-                log_message("socket_write() failed: " . socket_strerror($err));
-                break 2;
+                if ($err != SOCKET_EWOULDBLOCK && $err != SOCKET_EAGAIN) {
+                    log_message("socket_write() failed: " . socket_strerror($err));
+                    break 2;
+                }
             }
         }
     }
 
-    socket_close($client);
     socket_close($remote);
     log_message("Closed connection to $address:$dest_port");
 }
